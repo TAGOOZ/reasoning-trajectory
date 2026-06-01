@@ -7,8 +7,17 @@ import numpy as np
 from ..models.generation_output import CompleteGenerationOutput, TimestepArtifacts
 
 
-# Token ID for "Step" (with capital S)
-STEP_TOKEN_ID = 8468
+# Default step token IDs by tokenizer class
+STEP_TOKEN_IDS = {
+    "llama": 8468,
+    "qwen": 8304,
+}
+
+# Default hash (####) token IDs by tokenizer class
+HASH_TOKEN_IDS = {
+    "llama": 827,
+    "qwen": 820,
+}
 
 
 @dataclass
@@ -16,21 +25,31 @@ class WindowConfig:
     """Configuration for step-based artifact capture
 
     Args:
-        step_token_id: Token ID to identify step markers (default: 8468 for "Step")
+        step_token_id: Token ID to identify step markers
+        hash_token_id: Token ID to identify #### answer marker
         rank_high_threshold: Threshold for high confidence rank (default: 10)
                             rank <= threshold = High confidence
                             rank > threshold = Low confidence
+        tokenizer_class: 'llama' or 'qwen' (used for default token IDs)
     """
 
-    step_token_id: int = STEP_TOKEN_ID  # Token ID for "Step"
-    rank_high_threshold: int = 10  # Threshold for trajectory classification
+    tokenizer_class: str = "llama"
+    step_token_id: int = None
+    hash_token_id: int = None
+    rank_high_threshold: int = 10
+
+    def __post_init__(self):
+        if self.step_token_id is None:
+            self.step_token_id = STEP_TOKEN_IDS.get(self.tokenizer_class, 8468)
+        if self.hash_token_id is None:
+            self.hash_token_id = HASH_TOKEN_IDS.get(self.tokenizer_class, 827)
 
 
 def find_step_token_positions(
     timestep_artifacts: List[TimestepArtifacts],
     dp1_idx: int,
     dp2_idx: Optional[int] = None,
-    step_token_id: int = STEP_TOKEN_ID,
+    step_token_id: int = 8468,
 ) -> List[int]:
     """Find positions of "Step" tokens in generated sequence (only before dp2)
 
@@ -38,7 +57,7 @@ def find_step_token_positions(
         timestep_artifacts: List of per-timestep artifacts
         dp1_idx: Start of reasoning (absolute index)
         dp2_idx: Start of final answer (absolute index), or None
-        step_token_id: Token ID to search for (default: 8468 for "Step")
+        step_token_id: Token ID to search for
 
     Returns:
         List of absolute indices where step tokens appear (only in reasoning portion before dp2)
@@ -62,7 +81,7 @@ def compute_step_boundaries(
     timestep_artifacts: List[TimestepArtifacts],
     dp1_idx: int,
     dp2_idx: Optional[int],
-    step_token_id: int = STEP_TOKEN_ID,
+    step_token_id: int = 8468,
 ) -> List[Tuple[int, int]]:
     """Compute boundaries for each step (range from one "Step" token to the next)
 
@@ -70,7 +89,7 @@ def compute_step_boundaries(
         timestep_artifacts: List of per-timestep artifacts
         dp1_idx: Start of reasoning (absolute index)
         dp2_idx: Start of final answer (absolute index), or None
-        step_token_id: Token ID to search for (default: 8468 for "Step")
+        step_token_id: Token ID to search for
 
     Returns:
         List of (start_idx, end_idx) tuples for each step

@@ -75,17 +75,21 @@ class DatasetLoader:
             return self._dataset
 
         # Check if dataset is already downloaded locally
-        dataset_path = Path(self.dataset_config.path)
-        local_file = dataset_path / f"{split}.jsonl"
+        dataset_path = self.dataset_config.path
+        if dataset_path:
+            local_file = Path(dataset_path) / f"{split}.jsonl"
+        else:
+            local_file = None
 
-        if local_file.exists() and not force_reload:
+        if local_file and local_file.exists() and not force_reload:
             print(f"Loading {self.dataset_name} from local file: {local_file}")
             samples = self._load_from_jsonl(local_file)
         elif HF_AVAILABLE:
             print(f"Loading {self.dataset_name} from HuggingFace: {self.dataset_config.huggingface_id}")
             samples = self._load_from_huggingface(split)
-            # Cache locally
-            self._save_to_jsonl(samples, local_file)
+            # Cache locally if path is configured
+            if local_file:
+                self._save_to_jsonl(samples, local_file)
         else:
             raise RuntimeError(
                 "Dataset not found locally and HuggingFace datasets library is not available. "

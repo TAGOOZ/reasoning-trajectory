@@ -23,6 +23,7 @@ class HuggingFaceAdapter(ModelAdapter):
         """
         super().__init__(model_name, config)
         self.model_config = get_model_config(model_name)
+        self.tokenizer_class = getattr(self.model_config, 'tokenizer_class', 'llama')
 
         # Merge configurations (config overrides model_config)
         self.generation_config = {**self.model_config.config, **(config or {})}
@@ -42,14 +43,16 @@ class HuggingFaceAdapter(ModelAdapter):
 
         # Determine model path (local or HuggingFace Hub)
         model_path = self.model_config.path
-        if not Path(model_path).exists():
+        if model_path and Path(model_path).exists():
+            # Use local path
+            pass
+        elif self.model_config.huggingface_id:
             # Try HuggingFace Hub ID
-            if self.model_config.huggingface_id:
-                model_path = self.model_config.huggingface_id
-            else:
-                raise ValueError(
-                    f"Model path not found: {model_path} and no HuggingFace ID specified"
-                )
+            model_path = self.model_config.huggingface_id
+        else:
+            raise ValueError(
+                f"Model path not found: {model_path} and no HuggingFace ID specified"
+            )
 
         # Load tokenizer
         tokenizer_path = self.model_config.tokenizer_path or model_path
@@ -377,6 +380,14 @@ class HuggingFaceAdapter(ModelAdapter):
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
 
+        # Get hash token ID from config
+        try:
+            from ..config import load_config
+            token_ids_config = load_config().get_token_ids(self.tokenizer_class)
+            hash_token_id = token_ids_config["hash_token_id"]
+        except (KeyError, FileNotFoundError):
+            hash_token_id = 827  # fallback to llama default
+
         try:
             inputs = self._tokenizer(
                 prompts,
@@ -397,6 +408,8 @@ class HuggingFaceAdapter(ModelAdapter):
                 gold_answer_token_ids=gold_answer_token_ids,
                 capture_hidden_states=True,
                 pad_token_id=self._tokenizer.pad_token_id,
+                hash_token_id=hash_token_id,
+                tokenizer_class=self.tokenizer_class,
             )
 
             return outputs

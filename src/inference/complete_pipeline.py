@@ -99,6 +99,7 @@ def process_complete_generation(
     tokenizer,
     window_config: Optional[WindowConfig] = None,
     dataset_format: str = "gsm8k",
+    tokenizer_class: str = "llama",
 ) -> CompleteGenerationOutput:
     """Complete post-processing pipeline
 
@@ -108,6 +109,7 @@ def process_complete_generation(
         tokenizer: Tokenizer for answer tokenization
         window_config: Optional window configuration
         dataset_format: Dataset format for answer extraction ('gsm8k', 'math-500', etc.)
+        tokenizer_class: Tokenizer class ('llama' or 'qwen')
 
     Returns:
         Processed CompleteGenerationOutput with all fields filled
@@ -165,7 +167,7 @@ def process_complete_generation(
 
     # Compute step-based aggregations (at each "Step" token)
     if window_config is None:
-        window_config = WindowConfig()
+        window_config = WindowConfig(tokenizer_class=tokenizer_class)
 
     output.windows = compute_all_windows(output, window_config)
     output.num_steps = len(output.windows)

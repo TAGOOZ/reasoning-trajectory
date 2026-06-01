@@ -42,6 +42,7 @@ class ModelConfig:
     model_id: Optional[str] = None
     cache_dir: Optional[str] = None
     tokenizer_path: Optional[str] = None
+    tokenizer_class: str = "llama"  # 'llama' or 'qwen'
     config: Dict[str, Any] = None
 
     @classmethod
@@ -56,6 +57,7 @@ class ModelConfig:
             model_id=data.get("model_id"),
             cache_dir=data.get("cache_dir"),
             tokenizer_path=data.get("tokenizer_path"),
+            tokenizer_class=data.get("tokenizer_class", "llama"),
             config=data.get("config", {}),
         )
 
@@ -140,6 +142,22 @@ class Config:
         output_path = project_root / self._config["output"][output_type]
         output_path.mkdir(parents=True, exist_ok=True)
         return output_path
+
+    def get_token_ids(self, tokenizer_class: str) -> Dict[str, Any]:
+        """Get token ID configuration for a tokenizer class
+
+        Args:
+            tokenizer_class: 'llama' or 'qwen'
+
+        Returns:
+            Dict with step_token_id, hash_token_id, eos_extra_tokens
+        """
+        if tokenizer_class not in self._config.get("token_ids", {}):
+            available = list(self._config.get("token_ids", {}).keys())
+            raise KeyError(
+                f"Token IDs for '{tokenizer_class}' not found. Available: {available}"
+            )
+        return self._config["token_ids"][tokenizer_class]
 
     def get_settings(self) -> Dict[str, Any]:
         """Get general settings"""

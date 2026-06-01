@@ -28,6 +28,7 @@ def process_batch(
     max_new_tokens=1024,
     prompt_template="cot",
     window_config=None,
+    tokenizer_class="llama",
     log_fn=None,
 ):
     """Process a batch of samples with complete artifact capture
@@ -39,6 +40,7 @@ def process_batch(
         max_new_tokens: Maximum tokens to generate
         prompt_template: Prompt template to use
         window_config: Optional window configuration
+        tokenizer_class: Tokenizer class ('llama' or 'qwen')
         log_fn: Optional logging function for progress
 
     Returns:
@@ -137,6 +139,7 @@ def process_batch(
                 tokenizer=adapter._tokenizer,
                 window_config=window_config,
                 dataset_format=dataset_format,
+                tokenizer_class=tokenizer_class,
             )
 
             sample_post_time = time.time() - sample_post_start
@@ -402,7 +405,7 @@ def main():
                     pass  # Ignore errors loading shard checkpoints
 
     # Window configuration (0%, 10%, ..., 100%)
-    window_config = WindowConfig()
+    window_config = WindowConfig(tokenizer_class=adapter.tokenizer_class)
 
     # Run inference
     print("\n" + "=" * 80, flush=True)
@@ -487,9 +490,10 @@ def main():
                     batch_samples,
                     adapter,
                     args.model,
-                    max_new_tokens=1024,
+                    max_new_tokens=512,
                     prompt_template="cot",
                     window_config=window_config,
+                    tokenizer_class=adapter.tokenizer_class,
                     log_fn=tqdm.write,
                 )
                 break  # Success, exit retry loop

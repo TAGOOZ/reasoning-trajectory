@@ -34,6 +34,8 @@ def batch_greedy_generate_with_artifacts_twopass(
     gold_answer_token_ids: Optional[List[Optional[int]]] = None,
     capture_hidden_states: bool = True,
     pad_token_id: Optional[int] = None,
+    hash_token_id: int = 827,
+    tokenizer_class: str = "llama",
 ) -> List[CompleteGenerationOutput]:
     """Two-pass batched greedy generation with complete artifact capture
 
@@ -49,6 +51,8 @@ def batch_greedy_generate_with_artifacts_twopass(
         gold_answer_token_ids: Optional list of gold answer first token IDs
         capture_hidden_states: Whether to capture hidden states
         pad_token_id: Pad token ID for masking
+        hash_token_id: Token ID for #### answer marker
+        tokenizer_class: 'llama' or 'qwen'
 
     Returns:
         List of CompleteGenerationOutput (one per sample in batch)
@@ -85,7 +89,12 @@ def batch_greedy_generate_with_artifacts_twopass(
         attention_mask = attention_mask.to(model.device)
 
     with torch.no_grad():
-        eos_ids = [tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|eot_id|>")]
+        # Build EOS token list based on tokenizer class
+        eos_ids = [tokenizer.eos_token_id]
+        if tokenizer_class == "llama":
+            eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+            if eot_id is not None and eot_id != tokenizer.unk_token_id:
+                eos_ids.append(eot_id)
 
         generated_sequences = model.generate(
             input_ids,
@@ -169,10 +178,12 @@ def batch_greedy_generate_with_artifacts_twopass(
     else:
         unembed = model.get_input_embeddings().weight
 
-    # Process each sample individually in Pass 2
+        # Process each sample individually in Pass 2
     outputs = []
 
     for i in range(batch_size):
+        import gc as _gc
+
         # Get full sequence (prompt + generated)
         full_seq_ids = initial_input_ids_list[i] + generated_token_lists[i]
         full_seq_tensor = torch.tensor([full_seq_ids], dtype=torch.long, device=device)
@@ -192,8 +203,8 @@ def batch_greedy_generate_with_artifacts_twopass(
 
         gold_token_id = gold_answer_token_ids[i] if gold_answer_token_ids else None
 
-        # Extract per-timestep artifacts (keep tensors on GPU)
-        timestep_data = []
+        # Extract per-timestep artifacts (keep tensors on GPU, discard after scalar extraction)
+        timestep_artifacts = []
 
         for step in range(num_generated):
             pos = prompt_len + step
@@ -251,8 +262,8 @@ def batch_greedy_generate_with_artifacts_twopass(
                     for p in p_values
                 }
 
-            # "####" token features (token ID 827)
-            final_answer_token_id = 827
+            # "####" token features
+            final_answer_token_id = hash_token_id
 
             ce_final_answer = [
                 compute_cross_entropy(probs[0], final_answer_token_id)
@@ -300,64 +311,34 @@ def batch_greedy_generate_with_artifacts_twopass(
             rank_eos = compute_rank(final_logits, eos_token_id)
             prob_eos = get_prob(final_probs, eos_token_id)
 
-            timestep_data.append({
-                'next_token_id': next_token_id,
-                'next_token_str': next_token_str,
-                'hidden_states': sample_hidden_states,
-                'logits_per_layer': logits_per_layer,
-                'entropy_per_layer': entropy_per_layer,
-                'ce_next': ce_next,
-                'ce_gold': ce_gold,
-                'ce_final_answer': ce_final_answer,
-                'ranks_next': ranks_next,
-                'ranks_gold': ranks_gold,
-                'ranks_final_answer': ranks_final_answer,
-                'probs_final_answer': probs_final_answer,
-                'rank_gold': rank_gold,
-                'prob_gold': prob_gold,
-                'rank_final_answer': rank_final_answer,
-                'prob_final_answer': prob_final_answer,
-                'top_p_presence_gold': top_p_presence_gold,
-                'top_p_presence_final_answer': top_p_presence_final_answer,
-                'ranks_eos': ranks_eos,
-                'probs_eos': probs_eos,
-                'rank_eos': rank_eos,
-                'prob_eos': prob_eos,
-            })
-
-        # Convert to TimestepArtifacts
-        timestep_artifacts = []
-        for ts_data in timestep_data:
-            artifact = TimestepArtifacts(
-                next_token_id=ts_data['next_token_id'],
-                next_token_str=ts_data['next_token_str'],
-                hidden_states=ts_data['hidden_states'],
-                logits_per_layer=[lg[0] for lg in ts_data['logits_per_layer']],
-                entropy_per_layer=ts_data['entropy_per_layer'],
-                cross_entropy_next=ts_data['ce_next'],
-                cross_entropy_gold=ts_data['ce_gold'],
+            # Store only scalars and small lists - discard large tensors
+            timestep_artifacts.append(TimestepArtifacts(
+                next_token_id=next_token_id,
+                next_token_str=next_token_str,
+                hidden_states=None,
+                logits_per_layer=None,
+                entropy_per_layer=entropy_per_layer,
+                cross_entropy_next=ce_next,
+                cross_entropy_gold=ce_gold,
                 cross_entropy_prod=None,
-                cross_entropy_final_answer=ts_data['ce_final_answer'],
-                ranks_next=ts_data['ranks_next'],
-                ranks_gold=ts_data['ranks_gold'],
-                ranks_final_answer=ts_data['ranks_final_answer'],
-                probs_final_answer=ts_data['probs_final_answer'],
-                rank_gold=ts_data['rank_gold'],
+                cross_entropy_final_answer=ce_final_answer,
+                ranks_next=ranks_next,
+                ranks_gold=ranks_gold,
+                ranks_final_answer=ranks_final_answer,
+                probs_final_answer=probs_final_answer,
+                rank_gold=rank_gold,
                 rank_prod=None,
-                prob_gold=ts_data['prob_gold'],
+                prob_gold=prob_gold,
                 prob_prod=None,
-                rank_final_answer=ts_data['rank_final_answer'],
-                prob_final_answer=ts_data['prob_final_answer'],
-                top_p_presence_gold=ts_data['top_p_presence_gold'],
-                top_p_presence_final_answer=ts_data['top_p_presence_final_answer'],
-                ranks_eos=ts_data['ranks_eos'],
-                probs_eos=ts_data['probs_eos'],
-                rank_eos=ts_data['rank_eos'],
-                prob_eos=ts_data['prob_eos'],
-            )
-            timestep_artifacts.append(artifact)
-
-        del timestep_data
+                rank_final_answer=rank_final_answer,
+                prob_final_answer=prob_final_answer,
+                top_p_presence_gold=top_p_presence_gold,
+                top_p_presence_final_answer=top_p_presence_final_answer,
+                ranks_eos=ranks_eos,
+                probs_eos=probs_eos,
+                rank_eos=rank_eos,
+                prob_eos=prob_eos,
+            ))
 
         output = CompleteGenerationOutput(
             input_ids=initial_input_ids_list[i],
@@ -382,6 +363,7 @@ def batch_greedy_generate_with_artifacts_twopass(
         del full_seq_tensor
         del full_attention
         del timestep_artifacts
+        _gc.collect()
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
