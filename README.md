@@ -1,5 +1,8 @@
 # LLM Reasoning as Trajectories: Step-Specific Representation Geometry and Correctness Signals
 
+> **This repo is a rebuild of the original paper code using Qwen2.5 models to learn about trajectory-based reasoning.**
+> See [`README_QWEN.md`](README_QWEN.md) for detailed changes and diffs vs the original implementation.
+
 [Lihao Sun](https://slhleosun.github.io/) &#185;, [Hang Dong](https://www.microsoft.com/en-us/research/people/hangdong/) &#185;, [Bo Qiao](https://www.microsoft.com/en-us/research/people/boqiao/) &#185;, [Qingwei Lin](https://www.microsoft.com/en-us/research/people/qlin/) &#185;, [Dongmei Zhang](https://www.microsoft.com/en-us/research/people/dongmeiz/) &#185;, [Saravan Rajmohan](https://www.microsoft.com/en-us/research/people/saravar/) &#185;
 
 &#185; Microsoft
@@ -103,6 +106,8 @@ Edit `config/paths.yaml` to point to your local models and datasets. By default,
 | Base | `meta-llama/Llama-3.1-8B` | Pretrained, no instruction tuning |
 | Instruct | `meta-llama/Llama-3.1-8B-Instruct` | Instruction tuning + preference alignment |
 | R1-Distill | `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` | CoT distillation |
+| **Qwen2.5-7B-Instruct** | `Qwen/Qwen2.5-7B-Instruct` | **Added in this fork** — 83.0% on GSM8K (100 samples) |
+| **Qwen2.5-3B-Instruct** | `Qwen/Qwen2.5-3B-Instruct` | **Added in this fork** — smaller variant |
 
 Datasets: [GSM8K](https://huggingface.co/datasets/openai/gsm8k) (7,473 train / 1,319 test) and [MATH-500](https://huggingface.co/datasets/HuggingFaceTB/MATH-500) (500 questions).
 
