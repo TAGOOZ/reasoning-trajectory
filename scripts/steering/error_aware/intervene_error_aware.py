@@ -27,6 +27,7 @@ Usage:
         --mode PROLONG_LAST_N \
         --alpha 1.0 \
         --num-questions 50
+        [--regenerate]   # add a no-intervention second pass to measure noise floor
 """
 
 import sys
@@ -60,6 +61,8 @@ class InterventionConfig:
     max_interventions: int = 1  # Max number of intervention attempts (intervene only once)
     max_new_tokens: int = 1024  # Max tokens to generate
     predictor_threshold: float = 0.5  # Probability threshold for "incorrect" prediction
+    _baseline_seed: int = 0  # Seed for the (deterministic) baseline pass
+    _regenerate_seed: int = 1  # Seed for the regenerate control pass (do_regenerate=True)
 
 
 def extract_answer_after_hash(text: str) -> Optional[str]:
@@ -473,7 +476,9 @@ def generate_with_error_aware_intervention(
     config: InterventionConfig,
     device: torch.device,
     question_id: Optional[int] = None,
-    verbose: bool = True
+    verbose: bool = True,
+    do_regenerate: bool = False,
+    do_manual_control: bool = False,
 ) -> Dict:
     """Generate with error-aware intervention
 
@@ -502,43 +507,18 @@ def generate_with_error_aware_intervention(
     if verbose:
         print(f"  {q_prefix}→ Generating baseline (no intervention)...")
 
-    input_tensor = torch.tensor([input_ids], dtype=torch.long).to(device)
-    prompt_len = len(input_ids)
-
-    baseline_outputs = model.generate(
-        input_tensor,
-        max_new_tokens=config.max_new_tokens,
-        do_sample=False,  # Deterministic
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+    # Use the same seed as configured for the main run; _run_baseline_pass sets it.
+    baseline_result = _run_baseline_pass(
+        input_ids, question_text, gold_answer, model, tokenizer,
+        config, device, seed=getattr(config, '_baseline_seed', 0),
+        q_prefix=q_prefix, verbose=verbose,
     )
-
-    baseline_ids = baseline_outputs[0].tolist()
-    baseline_text = tokenizer.decode(baseline_ids[prompt_len:], skip_special_tokens=True)
-    baseline_answer = extract_answer_after_hash(baseline_text)
-    baseline_correct = evaluate_answer(baseline_answer if baseline_answer else "N/A", gold_answer)
-    baseline_num_steps = count_steps(baseline_text)
-
-    # Find #### position for reasoning length
-    hash_token_ids = tokenizer.encode("####", add_special_tokens=False)
-    baseline_hash_pos = None
-    for idx in range(prompt_len, len(baseline_ids)):
-        if baseline_ids[idx] in hash_token_ids:
-            baseline_hash_pos = idx
-            break
-    baseline_reasoning_length = (baseline_hash_pos - prompt_len) if baseline_hash_pos else (len(baseline_ids) - prompt_len)
-
-    baseline_result = {
-        "text": baseline_text,
-        "answer": baseline_answer if baseline_answer else "N/A",
-        "is_correct": bool(baseline_correct),
-        "num_steps": int(baseline_num_steps),
-        "reasoning_length": int(baseline_reasoning_length),
-    }
-
-    if verbose:
-        correct_mark = "✓" if baseline_correct else "✗"
-        print(f"  {q_prefix}→ Baseline: {correct_mark} answer={baseline_answer}, steps={baseline_num_steps}, len={baseline_reasoning_length}")
+    baseline_text = baseline_result["text"]
+    baseline_answer = baseline_result["answer"]
+    baseline_correct = baseline_result["is_correct"]
+    baseline_num_steps = baseline_result["num_steps"]
+    baseline_reasoning_length = baseline_result["reasoning_length"]
+    prompt_len = len(input_ids)
 
     # =====================================================================
     # ERROR-AWARE INTERVENTION GENERATION
@@ -546,183 +526,130 @@ def generate_with_error_aware_intervention(
     if verbose:
         print(f"  {q_prefix}→ Starting error-aware intervention generation...")
 
-    # Start with prompt
-    current_ids = input_ids.copy()
-    intervention_history = []
-    num_interventions = 0
-    has_checked_once = False  # Flag to ensure we only check predictor once
-    steering_active = False  # Flag to track if steering hooks are currently active
-    steering_handles = None  # Handles for active steering hooks
+    def _run_manual_loop(apply_steering: bool):
+        """Run the manual forward-pass loop.
 
-    # Generate tokens one by one, checking before each potential "####"
-    max_total_tokens = prompt_len + config.max_new_tokens
-    hash_token_id = hash_token_ids[0] if hash_token_ids else tokenizer.encode("####", add_special_tokens=False)[0]
+        apply_steering=True:  use the existing predictor + steering hook logic
+        apply_steering=False: same code path, predictor still runs (for matched
+                              statistics), but the steering hook is never applied
+                              — we just use the unsteered greedy argmax. This is
+                              the proper control: it isolates the effect of the
+                              steering vector from the inherent
+                              manual-no-KV-cache vs cached-generate difference.
+        """
+        cur_ids = input_ids.copy()
+        local_history = []
+        local_n_interventions = 0
+        local_has_checked = False
+        local_steering_active = False
+        local_steering_handles = None
+        local_max_total = prompt_len + config.max_new_tokens
+        local_hash_ids = tokenizer.encode("####", add_special_tokens=False)
+        local_hash_id = local_hash_ids[0] if local_hash_ids else tokenizer.encode("####", add_special_tokens=False)[0]
 
-    while len(current_ids) < max_total_tokens:
-        # Generate next token
-        input_tensor = torch.tensor([current_ids], dtype=torch.long).to(device)
-        outputs = model(input_tensor, use_cache=False, return_dict=True, output_hidden_states=True)
-        logits = outputs.logits[:, -1, :]  # [1, vocab_size]
-        next_token_id = torch.argmax(logits, dim=-1).item()
+        while len(cur_ids) < local_max_total:
+            input_tensor = torch.tensor([cur_ids], dtype=torch.long).to(device)
+            outputs = model(input_tensor, use_cache=False, return_dict=True, output_hidden_states=True)
+            logits = outputs.logits[:, -1, :]
+            next_token_id = torch.argmax(logits, dim=-1).item()
 
-        # Check if next token is "####"
-        if next_token_id == hash_token_id or next_token_id == tokenizer.eos_token_id:
-            # About to generate "####" or EOS
-            token_name = "####" if next_token_id == hash_token_id else "EOS"
-
-            # Only check with predictor once at the FIRST #### checkpoint
-            if not has_checked_once and next_token_id == hash_token_id:
-                if verbose:
-                    print(f"  {q_prefix}  ⚡ CHECKPOINT: Detected {token_name} at position {len(current_ids) - prompt_len}")
-
-                # Extract current position activations (hash position)
-                if verbose:
-                    print(f"  {q_prefix}    → Extracting hash activations...")
-                current_position = len(current_ids)
-                hash_activation = extract_activations_at_position(
-                    current_ids, current_position, model, device
-                )
-
-                # Extract last step activation
-                if verbose:
-                    print(f"  {q_prefix}    → Extracting last step activations...")
-                last_step_activation = find_last_step_activation(
-                    current_ids, model, tokenizer, device
-                )
-
-                if last_step_activation is None:
-                    # No steps found, cannot compute hash_minus_last
-                    # Allow token generation and mark as checked
+            if next_token_id == local_hash_id or next_token_id == tokenizer.eos_token_id:
+                token_name = "####" if next_token_id == local_hash_id else "EOS"
+                if not local_has_checked and next_token_id == local_hash_id:
                     if verbose:
-                        print(f"  {q_prefix}    ⚠ No steps found, allowing {token_name}")
-                    has_checked_once = True
-                    current_ids.append(next_token_id)
-                    if next_token_id == tokenizer.eos_token_id:
-                        break
-                    continue
-
-                # Compute hash_minus_last features for predictor layer
-                hash_minus_last = hash_activation[predictor_layer] - last_step_activation[predictor_layer]
-
-                # Predict correctness
-                if verbose:
-                    print(f"  {q_prefix}    → Running predictor (layer {predictor_layer})...")
-                is_predicted_incorrect, prob_incorrect = predict_correctness(
-                    hash_minus_last, predictor, config.predictor_threshold
-                )
-
-                intervention_history.append({
-                    "position": int(len(current_ids) - prompt_len),
-                    "predicted_incorrect": bool(is_predicted_incorrect),
-                    "prob_incorrect": float(prob_incorrect),
-                    "intervened": False,
-                })
-
-                if verbose:
-                    pred_label = "INCORRECT" if is_predicted_incorrect else "CORRECT"
-                    print(f"  {q_prefix}    → Predictor: {pred_label} (p_incorrect={prob_incorrect:.3f})")
-
-                # Mark that we've checked once
-                has_checked_once = True
-
-                if is_predicted_incorrect:
-                    # ALWAYS intervene if predicted incorrect (this is the ONLY check)
-                    if verbose:
-                        mode_desc = "multi-timestep" if config.multi_timestep else "single-timestep"
-                        print(f"  {q_prefix}    🎯 INTERVENING: Applying steering ({mode_desc})...")
-
-                    # Create steering hook
-                    steering_hook = SteeringHook(
-                        steering_vectors, config, num_layers, predictor_layer
+                        print(f"  {q_prefix}  ⚡ CHECKPOINT: Detected {token_name} at position {len(cur_ids) - prompt_len}")
+                    current_position = len(cur_ids)
+                    hash_activation = extract_activations_at_position(
+                        cur_ids, current_position, model, device
                     )
-                    steering_handles = register_steering_hooks(model, steering_hook)
-                    steering_active = True
+                    last_step_activation = find_last_step_activation(
+                        cur_ids, model, tokenizer, device
+                    )
+                    if last_step_activation is None:
+                        local_has_checked = True
+                        cur_ids.append(next_token_id)
+                        if next_token_id == tokenizer.eos_token_id:
+                            break
+                        continue
+                    hash_minus_last = hash_activation[predictor_layer] - last_step_activation[predictor_layer]
+                    is_predicted_incorrect, prob_incorrect = predict_correctness(
+                        hash_minus_last, predictor, config.predictor_threshold
+                    )
+                    local_history.append({
+                        "position": int(len(cur_ids) - prompt_len),
+                        "predicted_incorrect": bool(is_predicted_incorrect),
+                        "prob_incorrect": float(prob_incorrect),
+                        "intervened": False,
+                    })
+                    local_has_checked = True
 
-                    # Generate next token WITH steering
-                    input_tensor = torch.tensor([current_ids], dtype=torch.long).to(device)
-                    outputs = model(input_tensor, use_cache=False, return_dict=True, output_hidden_states=True)
-                    logits = outputs.logits[:, -1, :]
-                    next_token_id_steered = torch.argmax(logits, dim=-1).item()
+                    if is_predicted_incorrect:
+                        if apply_steering:
+                            if verbose:
+                                print(f"  {q_prefix}    🎯 INTERVENING: Applying steering...")
+                            steering_hook = SteeringHook(
+                                steering_vectors, config, num_layers, predictor_layer
+                            )
+                            local_steering_handles = register_steering_hooks(model, steering_hook)
+                            local_steering_active = True
+                            input_tensor2 = torch.tensor([cur_ids], dtype=torch.long).to(device)
+                            outputs2 = model(input_tensor2, use_cache=False, return_dict=True, output_hidden_states=True)
+                            logits2 = outputs2.logits[:, -1, :]
+                            next_token_id = torch.argmax(logits2, dim=-1).item()
+                            local_n_interventions += 1
+                            local_history[-1]["intervened"] = True
+                            local_history[-1]["steered_token"] = tokenizer.decode([next_token_id])
+                            if not config.multi_timestep:
+                                remove_hooks(local_steering_handles)
+                                local_steering_handles = None
+                                local_steering_active = False
+                        else:
+                            if verbose:
+                                print(f"  {q_prefix}    (control: predictor says INCORRECT, but NO steering applied)")
+                            local_history[-1]["control_skipped_steering"] = True
+                    # (else: predicted correct, just allow ####)
 
-                    current_ids.append(next_token_id_steered)
-                    num_interventions += 1
-
-                    intervention_history[-1]["intervened"] = True
-                    intervention_history[-1]["steered_token"] = tokenizer.decode([next_token_id_steered])
-
-                    if verbose:
-                        print(f"  {q_prefix}      → Steered token: '{tokenizer.decode([next_token_id_steered])}'")
-
-                    # For single-timestep mode, remove hooks immediately
-                    if not config.multi_timestep:
-                        remove_hooks(steering_handles)
-                        steering_handles = None
-                        steering_active = False
-                        if verbose:
-                            print(f"  {q_prefix}      → Steering deactivated (single-timestep mode)")
-
-                    # Continue generation
-                    if next_token_id_steered == tokenizer.eos_token_id:
-                        if steering_active:
-                            remove_hooks(steering_handles)
-                            steering_active = False
-                        break
-                    continue
-                else:
-                    # Predicted correct - allow "####"
-                    if verbose:
-                        print(f"  {q_prefix}    ✓ Predicted correct, allowing {token_name}")
-
-                    current_ids.append(next_token_id)
-                    if next_token_id == tokenizer.eos_token_id:
-                        break
-                    continue
-            else:
-                # Already checked once OR it's EOS - just allow the token
-                if verbose and next_token_id == hash_token_id:
-                    print(f"  {q_prefix}  → Allowing subsequent {token_name} at position {len(current_ids) - prompt_len} (already checked once)")
-                current_ids.append(next_token_id)
+                cur_ids.append(next_token_id)
                 if next_token_id == tokenizer.eos_token_id:
                     break
                 continue
-        else:
-            # Not "####", just add token
-            current_ids.append(next_token_id)
-            if next_token_id == tokenizer.eos_token_id:
+            else:
+                cur_ids.append(next_token_id)
+                if next_token_id == tokenizer.eos_token_id:
+                    break
+                continue
+
+        if local_steering_active and local_steering_handles is not None:
+            remove_hooks(local_steering_handles)
+
+        text = tokenizer.decode(cur_ids[prompt_len:], skip_special_tokens=True)
+        answer = extract_answer_after_hash(text)
+        correct = evaluate_answer(answer if answer else "N/A", gold_answer)
+        steps = count_steps(text)
+        hpos = None
+        for idx in range(prompt_len, len(cur_ids)):
+            if cur_ids[idx] in local_hash_ids:
+                hpos = idx
                 break
+        rlen = (hpos - prompt_len) if hpos else (len(cur_ids) - prompt_len)
+        return {
+            "text": text,
+            "answer": answer if answer else "N/A",
+            "is_correct": bool(correct),
+            "num_steps": int(steps),
+            "reasoning_length": int(rlen),
+            "num_interventions": int(local_n_interventions),
+            "intervention_history": local_history,
+        }
 
-    # Cleanup: Remove steering hooks if still active
-    if steering_active and steering_handles is not None:
-        remove_hooks(steering_handles)
-        steering_active = False
-        if verbose:
-            print(f"  {q_prefix}→ Steering deactivated at end of generation")
-
-    # Extract intervened results
-    intervened_text = tokenizer.decode(current_ids[prompt_len:], skip_special_tokens=True)
-    intervened_answer = extract_answer_after_hash(intervened_text)
-    intervened_correct = evaluate_answer(intervened_answer if intervened_answer else "N/A", gold_answer)
-    intervened_num_steps = count_steps(intervened_text)
-
-    # Find #### position for reasoning length
-    intervened_hash_pos = None
-    for idx in range(prompt_len, len(current_ids)):
-        if current_ids[idx] in hash_token_ids:
-            intervened_hash_pos = idx
-            break
-    intervened_reasoning_length = (intervened_hash_pos - prompt_len) if intervened_hash_pos else (len(current_ids) - prompt_len)
-
-    intervened_result = {
-        "text": intervened_text,
-        "answer": intervened_answer if intervened_answer else "N/A",
-        "is_correct": bool(intervened_correct),
-        "num_steps": int(intervened_num_steps),
-        "reasoning_length": int(intervened_reasoning_length),
-        "num_interventions": int(num_interventions),
-        "intervention_history": intervention_history,
-    }
+    # === Run the intervened generation (with steering) ===
+    intervened_result = _run_manual_loop(apply_steering=True)
 
     if verbose:
+        intervened_correct = intervened_result["is_correct"]
+        intervened_answer = intervened_result["answer"]
+        num_interventions = intervened_result["num_interventions"]
+        intervened_num_steps = intervened_result["num_steps"]
         correct_mark = "✓" if intervened_correct else "✗"
         print(f"  {q_prefix}→ Intervened: {correct_mark} answer={intervened_answer}, steps={intervened_num_steps}, interventions={num_interventions}")
 
@@ -736,12 +663,119 @@ def generate_with_error_aware_intervention(
         else:
             print(f"  {q_prefix}→ Maintained correctness")
 
+    # =====================================================================
+    # MANUAL CONTROL (only when do_manual_control=True)
+    # The baseline uses model.generate() (with KV cache), but the
+    # intervention loop uses manual forward passes (use_cache=False). These
+    # are different code paths that produce different greedy outputs, so
+    # `intervened − baseline` confounds the steering effect with this
+    # code-path difference. The manual control is the apples-to-apples
+    # comparison: same manual forward-pass code path, predictor still
+    # runs, but the steering hook is NEVER applied.
+    # TRUE steering effect = intervened_acc − manual_control_acc.
+    # =====================================================================
+    manual_control_result = None
+    if do_manual_control:
+        if verbose:
+            print(f"  {q_prefix}→ Running manual control (no steering, same code path as intervened)...")
+        manual_control_result = _run_manual_loop(apply_steering=False)
+        if verbose:
+            mc_correct = manual_control_result["is_correct"]
+            iv_correct = intervened_result["is_correct"]
+            mc_answer = manual_control_result["answer"]
+            iv_answer = intervened_result["answer"]
+            same_text = (mc_answer == iv_answer)
+            same_correct = (mc_correct == iv_correct)
+            print(f"  {q_prefix}→ ManualCtrl vs Intervened: same_answer={same_text}, same_correct={same_correct}")
+
+    # =====================================================================
+    # REGENERATE CONTROL (only when do_regenerate=True)
+    # Run a second baseline pass with a different seed to measure the
+    # noise floor: how much accuracy can change just from re-running the
+    # model (without intervention). The TRUE steering effect is then
+    # intervened_acc − regenerate_acc, not intervened_acc − baseline_acc.
+    # =====================================================================
+    regenerate_result = None
+    if do_regenerate:
+        if verbose:
+            print(f"  {q_prefix}→ Running regenerate control (no intervention, different seed)...")
+        regenerate_result = _run_baseline_pass(
+            input_ids, question_text, gold_answer, model, tokenizer,
+            config, device, seed=getattr(config, '_regenerate_seed', 1),
+            q_prefix=q_prefix, verbose=verbose,
+        )
+        if verbose:
+            same_answer = (regenerate_result["answer"] == baseline_answer)
+            same_correct = (regenerate_result["is_correct"] == baseline_correct)
+            print(f"  {q_prefix}→ Regen vs Baseline: same_answer={same_answer}, same_correct={same_correct}")
+
     return {
         "question": question_text,
         "gold_answer": gold_answer,
         "baseline": baseline_result,
         "intervened": intervened_result,
+        "manual_control": manual_control_result,
+        "regenerate": regenerate_result,
         "config": asdict(config),
+    }
+
+
+def _run_baseline_pass(
+    input_ids: List[int],
+    question_text: str,
+    gold_answer: str,
+    model,
+    tokenizer,
+    config: InterventionConfig,
+    device: torch.device,
+    seed: int,
+    q_prefix: str = "",
+    verbose: bool = False,
+) -> Dict:
+    """Run a single baseline (no-intervention) generation pass with a given seed.
+
+    Used both for the main baseline and for the regenerate control.
+    """
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    input_tensor = torch.tensor([input_ids], dtype=torch.long).to(device)
+    prompt_len = len(input_ids)
+
+    baseline_outputs = model.generate(
+        input_tensor,
+        max_new_tokens=config.max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
+    baseline_ids = baseline_outputs[0].tolist()
+    baseline_text = tokenizer.decode(baseline_ids[prompt_len:], skip_special_tokens=True)
+    baseline_answer = extract_answer_after_hash(baseline_text)
+    baseline_correct = evaluate_answer(baseline_answer if baseline_answer else "N/A", gold_answer)
+    baseline_num_steps = count_steps(baseline_text)
+
+    hash_token_ids = tokenizer.encode("####", add_special_tokens=False)
+    baseline_hash_pos = None
+    for idx in range(prompt_len, len(baseline_ids)):
+        if baseline_ids[idx] in hash_token_ids:
+            baseline_hash_pos = idx
+            break
+    baseline_reasoning_length = (baseline_hash_pos - prompt_len) if baseline_hash_pos else (len(baseline_ids) - prompt_len)
+
+    if verbose:
+        correct_mark = "✓" if baseline_correct else "✗"
+        print(f"  {q_prefix}→ Baseline (seed={seed}): {correct_mark} answer={baseline_answer}, steps={baseline_num_steps}")
+
+    return {
+        "text": baseline_text,
+        "answer": baseline_answer if baseline_answer else "N/A",
+        "is_correct": bool(baseline_correct),
+        "num_steps": int(baseline_num_steps),
+        "reasoning_length": int(baseline_reasoning_length),
+        "seed": int(seed),
     }
 
 
@@ -788,6 +822,16 @@ def main():
                         help="Output directory for results")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--regenerate", action="store_true",
+                        help="Run a second baseline (no-intervention) pass per question with a "
+                             "different seed. Lets you subtract the noise floor from the steering effect.")
+    parser.add_argument("--manual-control", action="store_true",
+                        help="Run an additional pass with the SAME manual forward-pass code path "
+                             "as the intervened run, but with the steering hook never applied. "
+                             "This is the proper apples-to-apples control: it isolates the "
+                             "steering-vector effect from the manual-vs-cached code-path "
+                             "difference between baseline and intervened. TRUE steering "
+                             "effect = intervened_acc − manual_control_acc.")
 
     # Sharding arguments (for multi-GPU)
     parser.add_argument("--shard-id", type=int, default=None,
@@ -817,17 +861,20 @@ def main():
     # Load steering vectors
     steering_vectors, _, _ = load_steering_vectors(args.steering)
 
-    # Use tuned threshold from predictor if available, otherwise use command-line arg
-    threshold = predictor.get('best_threshold', args.predictor_threshold)
-    if 'best_threshold' in predictor and args.predictor_threshold != 0.5:
-        print(f"\n⚠ Warning: Using tuned threshold {threshold:.3f} from predictor (ignoring --predictor-threshold {args.predictor_threshold})")
-    elif 'best_threshold' not in predictor:
-        print(f"\nUsing threshold {threshold:.3f} from command-line argument (predictor not tuned)")
+    # ALWAYS use command-line threshold. The previous behavior of auto-overriding with
+    # the stored `best_threshold` made alpha sweeps non-comparable (same questions
+    # always triggered the same intervention, hiding the real effect of alpha).
+    threshold = args.predictor_threshold
+    has_tuned = 'best_threshold' in predictor
+    if has_tuned:
+        tuned_val = float(predictor['best_threshold'])
+        print(f"\nNote: Predictor has stored best_threshold={tuned_val:.3f}, "
+              f"but using --predictor-threshold={threshold:.3f} (command-line wins)")
 
     print(f"\n{'='*100}")
     print(f"FINAL CONFIGURATION")
     print(f"{'='*100}")
-    print(f"Predictor threshold (τ): {threshold:.3f} {'(tuned from validation set)' if 'best_threshold' in predictor else '(default)'}")
+    print(f"Predictor threshold (τ): {threshold:.3f} (from --predictor-threshold)")
     print(f"Max new tokens: {args.max_new_tokens}")
     print(f"{'='*100}\n")
 
@@ -841,6 +888,8 @@ def main():
         max_interventions=args.max_interventions,
         max_new_tokens=args.max_new_tokens,
         predictor_threshold=threshold,
+        _baseline_seed=args.seed,
+        _regenerate_seed=args.seed + 1,
     )
 
     # Load model
@@ -937,7 +986,9 @@ def main():
                 model, tokenizer, predictor, steering_vectors,
                 intervention_config, device,
                 question_id=question_id,
-                verbose=True
+                verbose=True,
+                do_regenerate=args.regenerate,
+                do_manual_control=args.manual_control,
             )
 
             result["question_id"] = question_id
@@ -959,6 +1010,35 @@ def main():
                 stats["flipped_correct_to_wrong"] += 1
 
             stats["total_interventions"] += result["intervened"]["num_interventions"]
+
+            if args.manual_control and result.get("manual_control") is not None:
+                mc = result["manual_control"]
+                stats["manual_control_total"] = stats.get("manual_control_total", 0) + 1
+                if mc["is_correct"]:
+                    stats["manual_control_correct"] = stats.get("manual_control_correct", 0) + 1
+                if mc["is_correct"] != intervened_correct:
+                    stats["manual_control_differs"] = stats.get("manual_control_differs", 0) + 1
+                    if not mc["is_correct"] and intervened_correct:
+                        stats["true_steering_wins"] = stats.get("true_steering_wins", 0) + 1
+                    else:
+                        stats["true_steering_loses"] = stats.get("true_steering_loses", 0) + 1
+
+            if args.regenerate and result.get("regenerate") is not None:
+                regen_correct = result["regenerate"]["is_correct"]
+                stats["regenerate_total"] = stats.get("regenerate_total", 0) + 1
+                if regen_correct:
+                    stats["regenerate_correct"] = stats.get("regenerate_correct", 0) + 1
+                if baseline_correct != regen_correct:
+                    stats["regenerate_disagreements"] = stats.get("regenerate_disagreements", 0) + 1
+                    if baseline_correct and not regen_correct:
+                        stats["regenerate_went_wrong"] = stats.get("regenerate_went_wrong", 0) + 1
+                    else:
+                        stats["regenerate_fixed"] = stats.get("regenerate_fixed", 0) + 1
+                # True steering effect: intervened vs regenerate (same path, no intervention)
+                if not regen_correct and intervened_correct:
+                    stats["true_flipped_wrong_to_correct"] = stats.get("true_flipped_wrong_to_correct", 0) + 1
+                if regen_correct and not intervened_correct:
+                    stats["true_flipped_correct_to_wrong"] = stats.get("true_flipped_correct_to_wrong", 0) + 1
 
             # Determine predictor prediction and intervened correctness
             intervention_occurred = result["intervened"]["num_interventions"] > 0
@@ -1063,7 +1143,12 @@ def main():
         output_file = args.output_dir / f"{args.mode}_alpha{args.alpha}" / f"shard_{args.shard_id}" / "results.json"
         output_file.parent.mkdir(parents=True, exist_ok=True)
     else:
-        output_file = args.output_dir / f"results_{args.mode}_alpha{args.alpha}.json"
+        suffix = ""
+        if args.manual_control:
+            suffix += "_mc"
+        if args.regenerate:
+            suffix += "_regen"
+        output_file = args.output_dir / f"results_{args.mode}_alpha{args.alpha}{suffix}.json"
 
     # Compute summary
     if stats["total"] > 0:
@@ -1076,6 +1161,30 @@ def main():
             "flipped_correct_to_wrong": stats["flipped_correct_to_wrong"],
             "avg_interventions_per_question": stats["total_interventions"] / stats["total"],
         }
+        if args.manual_control and stats.get("manual_control_total", 0) > 0:
+            n = stats["manual_control_total"]
+            summary["manual_control_accuracy"] = stats["manual_control_correct"] / n
+            summary["manual_control_differs"] = stats.get("manual_control_differs", 0)
+            summary["true_steering_wins"] = stats.get("true_steering_wins", 0)
+            summary["true_steering_loses"] = stats.get("true_steering_loses", 0)
+            # The TRUE steering effect, isolated from code-path artifact
+            true_change = (stats["intervened_correct"] - stats["manual_control_correct"]) / n
+            summary["true_steering_effect"] = true_change
+            summary["code_path_artifact"] = (
+                summary["manual_control_accuracy"] - summary["baseline_accuracy"]
+            )
+        if args.regenerate and stats.get("regenerate_total", 0) > 0:
+            n = stats["regenerate_total"]
+            summary["regenerate_accuracy"] = stats["regenerate_correct"] / n
+            summary["regenerate_disagreements"] = stats.get("regenerate_disagreements", 0)
+            summary["regenerate_went_wrong"] = stats.get("regenerate_went_wrong", 0)
+            summary["regenerate_fixed"] = stats.get("regenerate_fixed", 0)
+            summary["noise_floor"] = stats.get("regenerate_disagreements", 0) / n
+            # TRUE steering effect: subtract the noise floor
+            true_change = (stats["intervened_correct"] - stats["regenerate_correct"]) / n
+            summary["true_accuracy_change"] = true_change
+            summary["true_flipped_wrong_to_correct"] = stats.get("true_flipped_wrong_to_correct", 0)
+            summary["true_flipped_correct_to_wrong"] = stats.get("true_flipped_correct_to_wrong", 0)
     else:
         summary = {}
 
@@ -1104,6 +1213,25 @@ def main():
     print(f"Flipped wrong→correct: {stats['flipped_wrong_to_correct']}")
     print(f"Flipped correct→wrong: {stats['flipped_correct_to_wrong']}")
     print(f"Avg interventions per question: {summary.get('avg_interventions_per_question', 0):.2f}")
+    if args.manual_control and 'manual_control_accuracy' in summary:
+        n = stats['manual_control_total']
+        print(f"\n--- MANUAL CONTROL (proper apples-to-apples) ---")
+        print(f"Manual control accuracy: {stats['manual_control_correct']}/{n} ({summary['manual_control_accuracy']:.2%})")
+        print(f"  Code-path artifact (manual_control − baseline): {summary['code_path_artifact']:+.2%}")
+        print(f"  Intervened vs manual_control differs on: {summary['manual_control_differs']} questions")
+        print(f"  True steering wins (intervened correct, control wrong): {summary['true_steering_wins']}")
+        print(f"  True steering loses (intervened wrong, control correct): {summary['true_steering_loses']}")
+        print(f"\n  ★ TRUE steering effect (intervened − manual_control): {summary['true_steering_effect']:+.2%} ★")
+    if args.regenerate and 'regenerate_accuracy' in summary:
+        n = stats['regenerate_total']
+        print(f"\n--- REGENERATE CONTROL (model.generate noise floor) ---")
+        print(f"Regenerate accuracy: {stats['regenerate_correct']}/{n} ({summary['regenerate_accuracy']:.2%})")
+        print(f"Disagreements with baseline: {summary['regenerate_disagreements']}/{n} (noise floor: {summary['noise_floor']:.2%})")
+        print(f"  Went correct→wrong: {summary['regenerate_went_wrong']}")
+        print(f"  Went wrong→correct: {summary['regenerate_fixed']}")
+        print(f"\nTRUE steering effect (intervened − regenerate): {summary['true_accuracy_change']:+.2%}")
+        print(f"  True flips wrong→correct: {summary['true_flipped_wrong_to_correct']}")
+        print(f"  True flips correct→wrong: {summary['true_flipped_correct_to_wrong']}")
     print(f"{'='*100}\n")
 
     return 0
