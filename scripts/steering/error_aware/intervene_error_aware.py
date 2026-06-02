@@ -432,9 +432,17 @@ class SteeringHook:
         steering = self.steering_vectors[layer_idx].unsqueeze(0).unsqueeze(0)  # [1, 1, hidden_dim]
 
         # Apply to last position only (multi-timestep is handled by keeping hooks active)
-        hidden_states[:, -1:, :] = hidden_states[:, -1:, :] + self.config.alpha * steering
+        if hidden_states.dim() == 3:
+            hidden_states[:, -1:, :] = hidden_states[:, -1:, :] + self.config.alpha * steering
+        else:
+            hidden_states = hidden_states + self.config.alpha * steering.squeeze(0)
 
-        return (hidden_states,) + output[1:]
+        if isinstance(output, tuple):
+            return (hidden_states,) + output[1:]
+        else:
+            # Some models return a ModelOutput object
+            output.hidden_states = hidden_states
+            return output
 
 
 def register_steering_hooks(model, steering_hook: SteeringHook) -> List:
