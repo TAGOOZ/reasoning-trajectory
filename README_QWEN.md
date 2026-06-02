@@ -6,7 +6,9 @@
 
 The original codebase was hardcoded for **Llama 3.1 8B** family models. We made it model-agnostic to support **Qwen2.5-7B-Instruct** (and other Qwen models).
 
-**Result:** Qwen2.5-7B-Instruct achieves **83.0% accuracy** on GSM8K (100 test samples) through the full inference + artifact capture pipeline.
+**Results:**
+- Qwen2.5-7B-Instruct: **85.0% accuracy** on GSM8K (500 test samples)
+- Trajectory predictors achieve **0.82 ROC-AUC** (best: step_diffs, layer 12)
 
 ---
 
@@ -117,24 +119,74 @@ timestep_artifacts.append(TimestepArtifacts(
 # Install dependencies
 pip install torch transformers accelerate datasets scikit-learn numpy scipy tqdm matplotlib seaborn pyyaml
 
-# Run inference (100 samples, ~75 min)
+# Run inference (500 samples, ~6 hours)
 PYTHONPATH=. python3 scripts/behavioral/batch_inference_complete.py \
   --model qwen2.5-7b-instruct \
   --dataset gsm8k \
   --split test \
   --batch-size 4 \
-  --max-samples 100
+  --max-samples 500
 
 # Output saved to: output/complete_artifacts/gsm8k_test_qwen2.5/
+# Supports checkpoint/resume — safe to re-run
+
+# Collect steering vectors (~30 min)
+HF_HUB_OFFLINE=1 PYTHONPATH=. python3 scripts/steering/collect_steering_vectors.py \
+  --model qwen2.5-7b-instruct \
+  --dataset gsm8k \
+  --split test
+
+# Analyze trajectory distances
+HF_HUB_OFFLINE=1 PYTHONPATH=. python3 scripts/trajectory/analyze_trajectory_distances.py \
+  --input output/complete_artifacts/gsm8k_test_qwen2.5/
+
+# Generate PCA trajectory plots
+HF_HUB_OFFLINE=1 PYTHONPATH=. python3 scripts/trajectory/plot_trajectories.py \
+  --input output/trajectory/qwen2.5_distances.json
+
+# Train correctness predictors (~1 hour)
+HF_HUB_OFFLINE=1 PYTHONPATH=. python3 scripts/predictors/train_correctness_predictors.py \
+  --model qwen2.5-7b-instruct \
+  --dataset gsm8k \
+  --split test
 ```
 
 ---
 
 ## Results
 
+### Behavioral Accuracy
+
 | Model | Dataset | Samples | Accuracy |
 |-------|---------|---------|----------|
-| Qwen2.5-7B-Instruct | GSM8K (test) | 100 | **83.0%** |
+| Qwen2.5-7B-Instruct | GSM8K (test) | 100 | 83.0% |
+| Qwen2.5-7B-Instruct | GSM8K (test) | 500 | **85.0%** |
+
+### Trajectory Predictors (9 feature sets × 28 layers = 252 configs)
+
+| Feature Set | Best AUC | Best Accuracy | Layer | Notes |
+|-------------|----------|---------------|-------|-------|
+| `step_diffs` | **0.8205** | 52.2% | 12 | Diffs between consecutive steps |
+| `hash_last_diffs_pca_joint` | 0.8073 | 52.0% | 26 | 3 vectors jointly PCA'd |
+| `hash_pca` | 0.7940 | 54.0% | 15 | Hash + diff, individually PCA'd |
+| `step1_step2_step3` | 0.7912 | 65.2% | 4 | Concatenation of 3 step activations |
+| `hash_only` | 0.7874 | 78.0% | 21 | Hash marker alone |
+| `hash_minus_last` | 0.7508 | 72.0% | 18 | Hash minus last step |
+| `hash_last_diffs_pca` | 0.7342 | 50.0% | 1 | 3 vectors individually PCA'd |
+| `step1_step2` | 0.6977 | 42.0% | 25 | Step 1 + Step 2 concatenated |
+| `step2_minus_step1` | 0.6944 | 60.0% | 5 | Step 2 minus Step 1 |
+
+**Note:** Accuracy ≠ AUC because threshold tuning trades precision/recall. AUC is the primary metric.
+
+### Trajectory Distance Analysis
+
+| Comparison | Euclidean Distance (Correct) | Euclidean Distance (Incorrect) | Divergence |
+|------------|------------------------------|--------------------------------|------------|
+| Step1 → Step2 | 384.21 | 383.48 | ~0 |
+| Step2 → Step3 | 232.40 | 227.50 | Small |
+| Hash → Last | 180.58 | 170.24 | **10.34** |
+
+Key finding: Early steps are nearly identical for correct/incorrect; late steps diverge — confirming the paper's thesis.
 
 ---
 
