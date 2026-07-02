@@ -809,9 +809,10 @@ def main():
         else:
             is_correct = evaluate_answer(produced_answer, gold_answer)
 
-        # Compute differences: answer - step for each step
+        # Compute differences: step - answer for each step
+        # (step - hash) direction prolongs reasoning by pushing AWAY from ####
         for step_idx, step_act in enumerate(step_activations):
-            difference = answer_act - step_act  # [num_layers, hidden_dim]
+            difference = step_act - answer_act  # [num_layers, hidden_dim]
 
             # Store difference for each layer
             for layer_idx in range(num_layers):

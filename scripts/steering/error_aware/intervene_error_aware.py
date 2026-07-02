@@ -228,6 +228,11 @@ def load_steering_vectors(npz_path: Path) -> Tuple[np.ndarray, int, int]:
     print(f"  Num layers: {num_layers}")
     print(f"  Hidden dim: {hidden_dim}")
 
+    # Fix sign: vectors stored as (hash - step) but we need (step - hash)
+    # to prolong reasoning. Negate to get correct direction.
+    steering_vectors = -steering_vectors
+    print(f"  Negated vectors for correct (step - hash) direction")
+
     return steering_vectors, num_layers, hidden_dim
 
 
@@ -376,7 +381,7 @@ class SteeringHook:
     ):
         """
         Args:
-            steering_vectors: [num_layers, hidden_dim] steering vectors (step - hash)
+            steering_vectors: [num_layers, hidden_dim] steering vectors (step - hash), already negated for correct direction
             config: InterventionConfig
             num_layers: Total number of layers
             predictor_layer: Layer index used by predictor
@@ -426,25 +431,27 @@ class SteeringHook:
 
         # Move steering vector to device if needed
         if self.device is None:
-            self.device = output[0].device
+            if isinstance(output, tuple):
+                self.device = output[0].device
+            else:
+                self.device = output.device
             self.steering_vectors = self.steering_vectors.to(self.device)
 
         # Apply steering: hidden_state + alpha * steering
         # (step - hash) vector should prolong reasoning, delaying ####
-        hidden_states = output[0]  # [batch_size, seq_len, hidden_dim]
-        steering = self.steering_vectors[layer_idx].unsqueeze(0).unsqueeze(0)  # [1, 1, hidden_dim]
-
-        # Apply to last position only (multi-timestep is handled by keeping hooks active)
-        if hidden_states.dim() == 3:
-            hidden_states[:, -1:, :] = hidden_states[:, -1:, :] + self.config.alpha * steering
-        else:
-            hidden_states = hidden_states + self.config.alpha * steering.squeeze(0)
+        # Note: vectors are already negated during loading so positive alpha = prolong
+        steering = self.steering_vectors[layer_idx]  # [hidden_dim]
 
         if isinstance(output, tuple):
+            hidden_states = output[0]  # [batch_size, seq_len, hidden_dim]
+            if hidden_states.dim() == 3:
+                hidden_states[:, -1:, :] = hidden_states[:, -1:, :] + self.config.alpha * steering.unsqueeze(0).unsqueeze(0)
+            else:
+                hidden_states[:, -1:, :] = hidden_states[:, -1:, :] + self.config.alpha * steering.unsqueeze(0)
             return (hidden_states,) + output[1:]
         else:
-            # Some models return a ModelOutput object
-            output.hidden_states = hidden_states
+            # Qwen2-style: output is a plain tensor [seq_len, hidden_dim]
+            output[:, -1:, :] = output[:, -1:, :] + self.config.alpha * steering.unsqueeze(0)
             return output
 
 
