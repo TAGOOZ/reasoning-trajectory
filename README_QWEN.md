@@ -9,6 +9,7 @@ The original codebase was hardcoded for **Llama 3.1 8B** family models. We made 
 **Results:**
 - Qwen2.5-7B-Instruct: **85.0% accuracy** on GSM8K (500 test samples)
 - Trajectory predictors achieve **0.82 ROC-AUC** (best: step_diffs, layer 12)
+- Error-aware steering: **-2.0% TRUE effect** (net harmful — see below)
 
 ---
 
@@ -149,6 +150,18 @@ HF_HUB_OFFLINE=1 PYTHONPATH=. python3 scripts/predictors/train_correctness_predi
   --model qwen2.5-7b-instruct \
   --dataset gsm8k \
   --split test
+
+# Run error-aware steering with manual-control baseline (~60 min)
+HF_HUB_OFFLINE=1 PYTHONPATH=. python3 scripts/steering/error_aware/intervene_error_aware.py \
+  --predictor output/predictors/hash_minus_last_correctness_layer18.npz \
+  --steering output/steering/qwen2.5_steering.npz \
+  --mode PROLONG_LAST_N --alpha 0.5 --n-layers 5 \
+  --predictor-threshold 0.5 --max-interventions 1 --manual-control \
+  --model qwen2.5-7b-instruct \
+  --merged-dir output/steering_test_set \
+  --num-questions 50 \
+  --output-dir output/error_aware_results \
+  --max-new-tokens 512 --seed 42
 ```
 
 ---
@@ -188,6 +201,57 @@ HF_HUB_OFFLINE=1 PYTHONPATH=. python3 scripts/predictors/train_correctness_predi
 
 Key finding: Early steps are nearly identical for correct/incorrect; late steps diverge — confirming the paper's thesis.
 
+### Error-Aware Steering (Inference-Time Intervention)
+
+Test set: 50 GSM8K questions (30 wrong + 20 correct from original run).
+Predictor: `hash_minus_last` at layer 18 (AUC=0.75).
+Steering mode: `PROLONG_LAST_N` (5 layers, `--max-interventions 1`).
+
+#### Two Critical Bugs Found and Fixed
+
+**Bug 1 — Sign inversion in steering vectors:**
+`collect_steering_vectors.py` computed `difference = answer_act - step_act` (i.e., `hash - step`), but the code comments and `SteeringHook` assumed `(step - hash)`. This made positive alpha steer **toward** `####` instead of away from it. Verified by testing: with old vectors, `alpha=+0.5` increases `####` logit; `alpha=-0.5` decreases it and flips to `Step`.
+
+**Fix:** Negate vectors at load time in `load_steering_vectors()`. Also corrected the collection script for future runs.
+
+**Bug 2 — Hook doesn't modify Qwen2 output:**
+Qwen2 transformer layers return a **plain tensor** `[seq_len, hidden_dim]`, not a tuple. The original hook code did `output[0]` (selecting the first token's hidden state instead of the full tensor) and the `isinstance(output, tuple)` branch never triggered. Result: **steering was never applied** despite hooks firing and logging interventions.
+
+**Fix:** Added tensor branch: `output[:, -1:, :] += alpha * steering; return output`.
+
+**Verification:** Before fix: `hidden_states_diff = 0.000000` (no modification). After fix: `####` → `Step` at alpha=0.5 on Qwen2.5-7B.
+
+#### Alpha Sweep Results (with both fixes)
+
+| Alpha | Changed (vs MC) | Wrong→Correct | Correct→Wrong | TRUE Effect |
+|-------|-----------------|---------------|---------------|-------------|
+| 0.1 | 19/50 | 5 | 4 | **-2%** |
+| 0.2 | 24/50 | 5 | 4 | **-2%** |
+| 0.3 | 24/50 | 5 | 4 | **-2%** |
+| 0.5 | 24/50 | 5 | 4 | **-2%** |
+
+**Manual control baseline** (`--manual-control`): 64% (same code path as intervened, no steering).
+**Intervened**: 62%.
+**TRUE steering effect: -2.0%.**
+
+Alpha 0.2+ all produce identical accuracy outcomes (text differs on same questions, but final answer unaffected). Alpha 0.1 is weaker (19 vs 24 text diffs) but same accuracy.
+
+#### Analysis: Why Steering Is Net Harmful
+
+The steering vector successfully flips `####` → `Step` (prolonging reasoning), but:
+1. **Not selective enough:** It helps some wrong answers (5 flips) but breaks correct ones (4 flips)
+2. **Predictor is accurate, steering is imprecise:** The predictor correctly identifies wrong questions, but the `(step - hash)` vector direction is too broad — it changes reasoning paths in ways that sometimes introduce new errors
+3. **Consistent across alpha:** The 4 regressions (Q117, Q236, Q257 + 1 code-path) happen at all alpha values, suggesting the issue is vector direction, not magnitude
+
+#### Regression Analysis
+
+| Question | Type | Interventions | What happened |
+|----------|------|---------------|---------------|
+| Q117 | Correct→Wrong | 1 | Steps 2→3, wrong answer introduced |
+| Q257 | Correct→Wrong | 1 | Steps 5→8, prolonged but wrong |
+| Q216 | Wrong→Correct | 1 | Steps 3→4, correct answer found |
+| Q107 | Wrong→Correct | 1 | Steps 3→4, correct answer found |
+
 ---
 
 ## What This Project Does
@@ -198,6 +262,8 @@ The paper demonstrates that:
 1. **Reasoning steps occupy distinct geometric regions** in representation space (linearly separable at deep layers)
 2. **Correct and incorrect reasoning diverge** at late steps — trajectory geometry predicts correctness (ROC-AUC 0.87)
 3. **Trajectory-based steering** enables error correction and reasoning length control at inference time
+
+On Qwen2.5-7B, we confirm findings (1) and (2) but find (3) is challenging: steering vectors flip `####` → `Step` (prolonging reasoning) but with net -2% accuracy effect due to insufficient selectivity.
 
 The pipeline:
 1. **Inference** → Generate CoT reasoning with per-timestep artifact capture
