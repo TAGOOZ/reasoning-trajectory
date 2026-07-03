@@ -525,6 +525,8 @@ def main():
                         help="Shard ID for multi-GPU processing")
     parser.add_argument("--num-shards", type=int, default=None,
                         help="Total number of shards for multi-GPU processing")
+    parser.add_argument("--correct-only", action="store_true",
+                        help="Only use correctly-answered questions for steering vectors")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-question details")
 
@@ -579,6 +581,8 @@ def main():
     print(f"Task: {task}")
     print(f"Model: {args.model}")
     print(f"Questions: {args.num_questions}")
+    if args.correct_only:
+        print(f"CORRECT-ONLY MODE: Only using correctly-answered questions for steering vectors")
     if use_r1_extraction:
         print(f"R1 MODE: Detected R1/DeepSeek model - will extract hash activations 1 timestep before first answer token")
     print(f"{'='*100}\n")
@@ -814,11 +818,11 @@ def main():
         for step_idx, step_act in enumerate(step_activations):
             difference = step_act - answer_act  # [num_layers, hidden_dim]
 
-            # Store difference for each layer
-            for layer_idx in range(num_layers):
-                layer_differences[layer_idx].append(difference[layer_idx])
-
-            stats["total_differences"] += 1
+            # Store difference for each layer (only if correct-only mode is off, or question is correct)
+            if not args.correct_only or is_correct:
+                for layer_idx in range(num_layers):
+                    layer_differences[layer_idx].append(difference[layer_idx])
+                stats["total_differences"] += 1
 
         # Store raw activations for visualization (with step numbers, question_id, and correctness)
         for step_idx, step_act in enumerate(step_activations):
